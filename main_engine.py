@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
@@ -128,7 +129,7 @@ class MigrationEngine:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Experimental WhatsApp candidate generator — no device restore")
     parser.add_argument("--direction", required=True,
-                        choices=["android_to_ios", "ios_to_android", "check_devices"])
+                        choices=["android_to_ios", "ios_to_android", "check_devices", "backup_android"])
     parser.add_argument("--whatsapp-type", default="regular", choices=["regular", "business"])
     parser.add_argument("--hex-key", help="Deprecated: prefer WHATSAPP_MIGRATION_HEX_KEY environment variable")
     parser.add_argument("--android-db")
@@ -139,8 +140,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir")
     parser.add_argument("--push-to-device", action="store_true")
     parser.add_argument("--android-serial")
+    parser.add_argument("--backup-dir")
     parser.add_argument("--is-rooted", action="store_true")
     return parser
+
+
+def resolve_adb() -> str:
+    """Use official platform-tools beside the installed engine, otherwise PATH."""
+    base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    name = "adb.exe" if os.name == "nt" else "adb"
+    bundled = base / "platform-tools" / name
+    return str(bundled) if bundled.is_file() else name
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -148,12 +158,27 @@ def main(argv: Optional[list] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     key = args.hex_key or os.environ.get(KEY_ENV, "")
     try:
+        if args.push_to_device:
+            raise RuntimeError("الاستعادة والدفع إلى الأجهزة معطّلان حتى إثبات التوافق.")
         if args.direction == "check_devices":
-            import subprocess
-            dm = DeviceManager(check_tools=False)
-            result = subprocess.run([dm.adb_path, "devices"], capture_output=True, text=True,
-                                    check=True, timeout=30)
-            ProgressEmitter.success("اكتمل فحص ADB فقط.", {"adb": result.stdout})
+            from android_backup import AndroidBackup
+            result = AndroidBackup(resolve_adb()).check_devices()
+            ProgressEmitter._emit({**result, "type": "devices", "message":
+                                  result.get("error") or "اكتمل فحص اتصال أندرويد عبر ADB فقط؛ لم يُفحص آيفون أو تُنقل بيانات."})
+            return 0 if result.get("adb_available") else 1
+        if args.direction == "backup_android":
+            from android_backup import AndroidBackup
+            if not args.android_serial or not args.backup_dir:
+                raise ValueError("حدد جهاز أندرويد ومجلد حفظ النسخة على اللابتوب.")
+            ProgressEmitter.step("backup", "نسخ ملفات واتساب المشتركة من أندرويد إلى اللابتوب...", 10)
+            result = AndroidBackup(resolve_adb()).backup(args.android_serial, args.backup_dir,
+                                                        args.whatsapp_type == "business")
+            if result.get("status") != "success":
+                ProgressEmitter._emit({**result, "type": "backup", "message":
+                                      "فشل النسخ أو بقي ناقصًا؛ لا تستخدم الناتج للتحويل. " + "; ".join(result.get("errors", []))})
+                return 1
+            ProgressEmitter._emit({**result, "type": "backup", "message":
+                                  "اكتمل نسخ الملفات المتاحة محليًا فقط؛ ليست نسخة كاملة للتطبيق ولم يتم النقل إلى آيفون."})
             return 0
         if args.direction == "ios_to_android" or args.push_to_device:
             raise RuntimeError("الاستعادة والدفع إلى الأجهزة معطّلان حتى إثبات التوافق؛ لا يُعلن نقل تجريبي كنجاح.")

@@ -554,82 +554,8 @@ class IOSToAndroidConverter:
         logger.info(f"تم نقل {len(media_items)} عنصر وسائط إلى مجلدات Android وتسجيلها في message_media.")
 
     def _encrypt_to_crypt15(self, db_path: str, output_path: str, reference_path: Optional[str] = None) -> None:
-        """
-        إعادة تشفير msgstore.db إلى crypt15.
-        يحاول أولاً استخدام أداة waencrypt (إذا كانت متاحة) مع ملف مرجعي.
-        إذا لم تتوفر، يستخدم PyCryptodome كحل احتياطي (AES-GCM).
-        """
-        # المحاولة 1: استخدام waencrypt
-        try:
-            cmd = ["waencrypt"]
-            if reference_path and os.path.exists(reference_path):
-                cmd.extend(["--reference", reference_path])
-            cmd.extend([self.hex_key, db_path, output_path])
-            
-            import subprocess
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info("تم التشفير باستخدام waencrypt بنجاح.")
-            return
-        except (FileNotFoundError, subprocess.CalledProcessError) as e:
-            logger.warning(f"waencrypt غير متاح أو فشل: {e}. محاولة التشفير اليدوي باستخدام PyCryptodome.")
-
-        # المحاولة 2: التشفير اليدوي باستخدام PyCryptodome
-        if not CRYPTO_AVAILABLE:
-            raise RuntimeError("PyCryptodome غير مثبت. لا يمكن إجراء التشفير اليدوي. قم بتثبيت pycryptodome.")
-
-        # تحويل المفتاح من hex إلى bytes (32 بايت)
-        try:
-            key_bytes = bytes.fromhex(self.hex_key)
-        except ValueError:
-            raise ValueError("المفتاح يجب أن يكون 64 حرفًا hex صالحًا.")
-
-        if len(key_bytes) != 32:
-            raise ValueError("المفتاح يجب أن يكون 32 بايت (64 حرف hex).")
-
-        # قراءة قاعدة البيانات غير المشفرة
-        with open(db_path, 'rb') as f:
-            plaintext = f.read()
-
-        # ضغط البيانات باستخدام zlib (كما تفعل واتساب)
-        compressed = zlib.compress(plaintext)
-
-        # إنشاء IV عشوائي (16 بايت)
-        iv = os.urandom(16)
-
-        # تشفير AES-GCM
-        cipher = AES.new(key_bytes, AES.MODE_GCM, nonce=iv)
-        ciphertext, tag = cipher.encrypt_and_digest(compressed)
-
-        # بناء ملف crypt15
-        # البنية التقريبية: [Header 67 بايت] + [IV 16 بايت] + [Ciphertext] + [Tag 16 بايت]
-        # الـ Header يحتوي على بيانات وصفية. نستخدم Header افتراضي (قد لا يعمل مع جميع الإصدارات).
-        # للحصول على أفضل توافق، يوصى بشدة باستخدام ملف مرجعي.
-        # هنا نصنع Header بسيطًا (67 بايت) مع بعض القيم الافتراضية.
-        # ملاحظة: هذا التشفير قد لا يكون متوافقًا تمامًا مع واتساب إذا لم يكن الـ Header صحيحًا.
-        # يفضل استخدام waencrypt مع مرجع.
-        
-        # Header افتراضي: 67 بايت. نضع بعض البايتات كعلامة.
-        # في الواقع، crypt15 header يحتوي على protobuf. هنا نستخدم Header مبسط.
-        header = b'\x00' * 67  # هذا ليس صحيحًا تمامًا، لكنه قد يعمل في بعض الحالات.
-        # لتحسين التوافق، يمكننا محاولة استخدام Header من ملف مرجعي إذا توفر.
-        if reference_path and os.path.exists(reference_path):
-            with open(reference_path, 'rb') as f:
-                ref_data = f.read()
-            # استخراج أول 67 بايت كـ Header (تقديري)
-            if len(ref_data) >= 67:
-                header = ref_data[:67]
-                logger.info("تم استخدام Header من الملف المرجعي.")
-
-        # بناء الملف النهائي
-        # ملاحظة: ترتيب IV والبيانات قد يختلف. وفقًا للمراجع، في crypt15:
-        # header (67 بايت) ثم IV (16 بايت) ثم ciphertext ثم tag.
-        # هذا ما سنتبعه.
-        output_data = header + iv + ciphertext + tag
-
-        with open(output_path, 'wb') as f:
-            f.write(output_data)
-
-        logger.info(f"تم التشفير اليدوي إلى {output_path} (قد لا يكون متوافقًا تمامًا بدون مرجع).")
+        """Do not emit fabricated crypt15 headers when the upstream tool fails."""
+        self.dm.encrypt_crypt15(db_path, output_path, self.hex_key, reference_path)
 
 
 # مثال للاستخدام (للتجربة فقط)

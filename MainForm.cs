@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Collections.Generic;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -28,6 +29,8 @@ namespace WhatsAppMigrator
 
         private Process? _engineProcess;
         private bool _isRunning;
+        private bool _reportedSuccess;
+        private bool _reportedCandidate;
 
         public MainForm()
         {
@@ -48,7 +51,7 @@ namespace WhatsAppMigrator
             // ===== Header =====
             var header = new Label
             {
-                Text = "⚡ WhatsApp Migration Engine",
+                Text = "⚡ WhatsApp Migration Engine — Experimental Candidate",
                 Font = new Font("Segoe UI", 20f, FontStyle.Bold),
                 ForeColor = Theme.NeonGreen,
                 Dock = DockStyle.Top,
@@ -61,7 +64,7 @@ namespace WhatsAppMigrator
 
             var subtitle = new Label
             {
-                Text = "نقل آمن ثنائي الاتجاه للمحادثات والوسائط — بدون فورمات",
+                Text = "مرشح تجريبي للنقل ثنائي الاتجاه — لا يوجد نقل معتمد من الجهاز",
                 Font = new Font("Segoe UI", 9f, FontStyle.Italic),
                 ForeColor = Theme.TextSecondary,
                 Dock = DockStyle.Top,
@@ -96,8 +99,8 @@ namespace WhatsAppMigrator
             _directionCombo.BackColor = Theme.SurfaceAlt; _directionCombo.ForeColor = Theme.TextPrimary;
             _directionCombo.FlatStyle = FlatStyle.Flat;
             _directionCombo.Items.AddRange(new object[] {
-                "أندرويد ← آيفون (Android → iOS)",
-                "آيفون ← أندرويد (iOS → Android)"
+                "من أندرويد إلى آيفون (Android → iOS)",
+                "من آيفون إلى أندرويد (iOS → Android)"
             });
             _directionCombo.SelectedIndex = 0;
             _directionCombo.SelectedIndexChanged += (_, _) => UpdateVisibility();
@@ -133,6 +136,7 @@ namespace WhatsAppMigrator
             _hexKeyBox.Width = 640;
             _hexKeyBox.BackColor = Theme.SurfaceAlt; _hexKeyBox.ForeColor = Theme.NeonAmber;
             _hexKeyBox.BorderStyle = BorderStyle.FixedSingle;
+            _hexKeyBox.UseSystemPasswordChar = true;
             _hexKeyBox.Font = Theme.MonoFont;
             generalPanel.Controls.Add(_hexKeyBox);
 
@@ -145,11 +149,11 @@ namespace WhatsAppMigrator
             };
             Controls.Add(pathsPanel);
 
-            AddPathRow(pathsPanel, "قاعدة بيانات أندرويد:", ref _androidDbBox, 20, false, "اختر msgstore.db أو crypt15...");
-            AddPathRow(pathsPanel, "مجلد ميديا أندرويد:", ref _androidMediaBox, 62, true, "اختر مجلد Media...");
-            AddPathRow(pathsPanel, "نسخة iOS الاحتياطية:", ref _iosBackupBox, 104, true, "اختر مجلد Backup...");
-            AddPathRow(pathsPanel, "مسار الإخراج (msgstore.db):", ref _outputDbBox, 146, false, "اختر مكان حفظ msgstore.db...");
-            AddPathRow(pathsPanel, "ملف crypt15 مرجعي (اختياري):", ref _referenceCryptBox, 188, false, "اختر crypt15 مرجعي...");
+            AddPathRow(pathsPanel, "قاعدة بيانات أندرويد:", _androidDbBox, 20, false, "اختر msgstore.db أو crypt15...");
+            AddPathRow(pathsPanel, "مجلد ميديا أندرويد:", _androidMediaBox, 62, true, "اختر مجلد Media...");
+            AddPathRow(pathsPanel, "نسخة iOS الاحتياطية:", _iosBackupBox, 104, true, "اختر مجلد Backup...");
+            AddPathRow(pathsPanel, "مسار حفظ الإخراج (msgstore.db):", _outputDbBox, 146, false, "اختر مكان حفظ msgstore.db...", true);
+            AddPathRow(pathsPanel, "ملف crypt15 مرجعي (اختياري):", _referenceCryptBox, 188, false, "اختر crypt15 مرجعي...");
 
             // ===== الأزرار والحالة =====
             var actionPanel = new Panel
@@ -211,8 +215,8 @@ namespace WhatsAppMigrator
             UpdateVisibility();
         }
 
-        private void AddPathRow(NeonPanel parent, string labelText, ref TextBox box,
-                                 int top, bool isFolder, string placeholder)
+        private void AddPathRow(NeonPanel parent, string labelText, TextBox box,
+                                 int top, bool isFolder, string placeholder, bool isSaveFile = false)
         {
             var lbl = new Label
             {
@@ -240,6 +244,11 @@ namespace WhatsAppMigrator
                     using var dlg = new FolderBrowserDialog();
                     if (dlg.ShowDialog() == DialogResult.OK) box.Text = dlg.SelectedPath;
                 }
+                else if (isSaveFile)
+                {
+                    using var dlg = new SaveFileDialog { Filter = "WhatsApp database (*.db)|*.db|All files (*.*)|*.*" };
+                    if (dlg.ShowDialog() == DialogResult.OK) box.Text = dlg.FileName;
+                }
                 else
                 {
                     using var dlg = new OpenFileDialog();
@@ -262,8 +271,9 @@ namespace WhatsAppMigrator
 
         // ---------- تشغيل المحرك ----------
 
-        private string LocateEngine()
+        private string LocateEngine(out string? scriptPath)
         {
+            scriptPath = null;
             // 1) بجانب EXE (بعد التغليف بـ PyInstaller)
             var exePath = Path.Combine(AppContext.BaseDirectory, "main_engine.exe");
             if (File.Exists(exePath)) return exePath;
@@ -271,7 +281,7 @@ namespace WhatsAppMigrator
             // 2) مسار تطوير محلي
             var devPath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..",
                                         "main_engine.py");
-            if (File.Exists(devPath)) return "python \"" + Path.GetFullPath(devPath) + "\"";
+            if (File.Exists(devPath)) { scriptPath = Path.GetFullPath(devPath); return "python"; }
 
             throw new FileNotFoundException(
                 "لم يتم العثور على main_engine.exe بجانب التطبيق ولا main_engine.py في مسار التطوير.");
@@ -281,28 +291,29 @@ namespace WhatsAppMigrator
         {
             if (_isRunning) return;
 
-            // تحقق من المدخلات
-            if (_hexKeyBox.Text.Length != 64)
+            string hexKey = _hexKeyBox.Text.Trim();
+            bool requiresKey = _androidDbBox.Text.Trim().EndsWith(".crypt15", StringComparison.OrdinalIgnoreCase);
+            if ((hexKey.Length > 0 && (hexKey.Length != 64 || !IsHex(hexKey))) || (requiresKey && hexKey.Length == 0))
             {
                 MessageBox.Show("المفتاح يجب أن يكون 64 حرف hex.", "خطأ في المفتاح",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            string engineCmd = LocateEngine();
-            string args = BuildArguments();
-            _logBox.Clear();
-            AppendLog($"> {engineCmd} {args}\n");
-
-            _isRunning = true;
-            _startBtn.Enabled = false;
-            _cancelBtn.Enabled = true;
-            _progress.Value = 0;
-            SetStatus("جارٍ التشغيل...", Theme.NeonAmber);
-
             try
             {
-                await RunEngineAsync(engineCmd, args);
+                string engine = LocateEngine(out string? scriptPath);
+                IReadOnlyList<string> args = BuildArguments();
+                _logBox.Clear();
+                AppendLog("> بدء تشغيل مرشح النقل (تم إخفاء المفتاح والمعاملات الحساسة).\n");
+                _reportedSuccess = false;
+                _reportedCandidate = false;
+                _isRunning = true;
+                _startBtn.Enabled = false;
+                _cancelBtn.Enabled = true;
+                _progress.Value = 0;
+                SetStatus("جارٍ تشغيل المرشح التجريبي...", Theme.NeonAmber);
+                await RunEngineAsync(engine, scriptPath, args, hexKey);
             }
             catch (Exception ex)
             {
@@ -319,42 +330,40 @@ namespace WhatsAppMigrator
             }
         }
 
-        private string BuildArguments()
+        private IReadOnlyList<string> BuildArguments()
         {
-            var sb = new StringBuilder();
+            var args = new List<string>();
             bool androidToIos = _directionCombo.SelectedIndex == 0;
-            sb.Append("--direction ");
-            sb.Append(androidToIos ? "android_to_ios" : "ios_to_android");
-            sb.Append(" --whatsapp-type ");
-            sb.Append(_waTypeCombo.SelectedIndex == 1 ? "business" : "regular");
-            sb.Append(" --hex-key ");
-            sb.Append(Quote(_hexKeyBox.Text.Trim()));
-
+            args.Add("--direction"); args.Add(androidToIos ? "android_to_ios" : "ios_to_android");
+            args.Add("--whatsapp-type"); args.Add(_waTypeCombo.SelectedIndex == 1 ? "business" : "regular");
             if (androidToIos)
             {
-                sb.Append(" --android-db ").Append(Quote(_androidDbBox.Text.Trim()));
-                sb.Append(" --android-media ").Append(Quote(_androidMediaBox.Text.Trim()));
-                sb.Append(" --ios-backup ").Append(Quote(_iosBackupBox.Text.Trim()));
+                args.Add("--android-db"); args.Add(_androidDbBox.Text.Trim());
+                args.Add("--android-media"); args.Add(_androidMediaBox.Text.Trim());
+                args.Add("--ios-backup"); args.Add(_iosBackupBox.Text.Trim());
             }
             else
             {
-                sb.Append(" --ios-backup ").Append(Quote(_iosBackupBox.Text.Trim()));
-                sb.Append(" --output-db ").Append(Quote(_outputDbBox.Text.Trim()));
+                args.Add("--ios-backup"); args.Add(_iosBackupBox.Text.Trim());
+                args.Add("--output-db"); args.Add(_outputDbBox.Text.Trim());
                 if (!string.IsNullOrWhiteSpace(_referenceCryptBox.Text))
-                    sb.Append(" --reference-crypt ").Append(Quote(_referenceCryptBox.Text.Trim()));
+                { args.Add("--reference-crypt"); args.Add(_referenceCryptBox.Text.Trim()); }
             }
-            return sb.ToString();
+            return args;
         }
 
-        private static string Quote(string s) =>
-            string.IsNullOrEmpty(s) ? "\"\"" : "\"" + s.Replace("\"", "\\\"") + "\"";
+        private static bool IsHex(string value)
+        {
+            foreach (char c in value) if (!Uri.IsHexDigit(c)) return false;
+            return true;
+        }
 
-        private async Task RunEngineAsync(string commandLine, string arguments)
+        private async Task RunEngineAsync(string executable, string? scriptPath,
+                                          IReadOnlyList<string> arguments, string hexKey)
         {
             var psi = new ProcessStartInfo
             {
-                FileName = ResolveExecutable(commandLine, out string finalArgs),
-                Arguments = finalArgs == null ? arguments : finalArgs + " " + arguments,
+                FileName = executable,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -362,52 +371,46 @@ namespace WhatsAppMigrator
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8,
             };
-            // إذا كان الأمر python "path" - نحتاج معالجة خاصة
-            if (commandLine.StartsWith("python"))
-            {
-                psi.FileName = "python";
-                var scriptPath = commandLine.Replace("python", "").Trim().Trim('"');
-                psi.Arguments = $"\"{scriptPath}\" {arguments}";
-            }
+            if (scriptPath != null) psi.ArgumentList.Add(scriptPath);
+            foreach (string argument in arguments) psi.ArgumentList.Add(argument);
+            psi.Environment["WHATSAPP_MIGRATION_HEX_KEY"] = hexKey;
 
-            _engineProcess = new Process { StartInfo = psi, EnableRaisingEvents = true };
-
-            var tcs = new TaskCompletionSource<int>();
-            _engineProcess.Exited += (_, _) => tcs.TrySetResult(_engineProcess.ExitCode);
-            _engineProcess.OutputDataReceived += (_, e) => { if (e.Data != null) HandleOutputLine(e.Data); };
-            _engineProcess.ErrorDataReceived += (_, e) => { if (e.Data != null) AppendLog("[STDERR] " + e.Data + "\n"); };
-
-            _engineProcess.Start();
-            _engineProcess.BeginOutputReadLine();
-            _engineProcess.BeginErrorReadLine();
-
-            int exitCode = await tcs.Task;
+            using var process = new Process { StartInfo = psi };
+            _engineProcess = process;
+            string Redact(string value) => hexKey.Length == 0 ? value : value.Replace(hexKey, "[REDACTED]");
+            process.OutputDataReceived += (_, e) => { if (e.Data != null) HandleOutputLine(Redact(e.Data)); };
+            process.ErrorDataReceived += (_, e) => { if (e.Data != null) AppendLog("[STDERR] " + Redact(e.Data) + "\n"); };
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            await process.WaitForExitAsync();
+            int exitCode = process.ExitCode;
             AppendLog($"\n[محرك بايثون انتهى بكود {exitCode}]\n");
-            if (exitCode == 0)
+            if (exitCode == 0 && _reportedSuccess)
             {
                 SetStatus("اكتملت العملية بنجاح ✔", Theme.NeonGreen);
                 _progress.Value = 100;
             }
             else
             {
-                SetStatus($"فشل المحرك (كود {exitCode})", Theme.NeonRed);
+                SetStatus(exitCode == 0 ? "انتهى المرشح دون إثبات نقل معتمد." : $"فشل المحرك (كود {exitCode})",
+                    exitCode == 0 ? Theme.NeonAmber : Theme.NeonRed);
             }
-        }
-
-        private static string ResolveExecutable(string cmd, out string? modifiedArgs)
-        {
-            modifiedArgs = null;
-            return cmd;
         }
 
         private void HandleOutputLine(string line)
         {
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(() => HandleOutputLine(line)));
+                return;
+            }
             const string prefix = "::PROGRESS::";
             if (line.StartsWith(prefix))
             {
                 try
                 {
-                    var doc = JsonDocument.Parse(line.Substring(prefix.Length));
+                    using var doc = JsonDocument.Parse(line.Substring(prefix.Length));
                     var root = doc.RootElement;
                     string type = root.GetProperty("type").GetString() ?? "";
                     string msg = root.TryGetProperty("message", out var m) ? (m.GetString() ?? "") : "";
@@ -423,7 +426,24 @@ namespace WhatsAppMigrator
                             SetStatus(msg, Theme.NeonCyan);
                             AppendLog($"• {msg}  ({pct}%)\n");
                             break;
+                        case "candidate":
+                        case "candidate_success":
+                            _reportedCandidate = true;
+                            AppendLog($"⚠ مرشح تجريبي: {msg}\n");
+                            if (root.TryGetProperty("output_db", out var candidatePath))
+                                AppendLog("قاعدة الفحص: " + candidatePath.GetString() + "\n");
+                            if (root.TryGetProperty("report", out var reportPath))
+                                AppendLog("تقرير القيود والأعداد: " + reportPath.GetString() + "\n");
+                            SetStatus("مرشح تجريبي — لم يُثبت النقل ولم تُعدّل النسخة الاحتياطية.", Theme.NeonAmber);
+                            break;
                         case "success":
+                            if (_reportedCandidate)
+                            {
+                                AppendLog($"⚠ تم تجاهل نجاح غير معتمد بعد حدث المرشح: {msg}\n");
+                                SetStatus("مرشح تجريبي — لم يُثبت النقل ولم تُعدّل النسخة الاحتياطية.", Theme.NeonAmber);
+                                break;
+                            }
+                            _reportedSuccess = true;
                             AppendLog($"✔ {msg}\n");
                             SetStatus(msg, Theme.NeonGreen);
                             _progress.Value = 100;

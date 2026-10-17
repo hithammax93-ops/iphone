@@ -44,11 +44,13 @@ class DeviceManager:
     فئة مسؤولة عن إدارة التفاعلات مع أجهزة Android (عبر ADB) و iOS (عبر pymobiledevice3).
     """
 
-    def __init__(self, adb_path: str = "adb", pymobiledevice3_path: str = "python -m pymobiledevice3"):
+    def __init__(self, adb_path: str = "adb", pymobiledevice3_path: str = "python -m pymobiledevice3",
+                 check_tools: bool = True):
         self.adb_path = adb_path
         self.pymobiledevice3_path = pymobiledevice3_path
-        self._check_adb()
-        self._check_pymobiledevice3()
+        if check_tools:
+            self._check_adb()
+            self._check_pymobiledevice3()
 
     def _check_adb(self):
         try:
@@ -108,45 +110,40 @@ class DeviceManager:
     # ---------- عمليات التشفير (wa-crypt-tools) ----------
 
     def decrypt_crypt15(self, encrypted_db_path: str, output_db_path: str, hex_key: str = DEFAULT_HEX_KEY) -> None:
-        """فك تشفير ملف msgstore.db.crypt15 باستخدام مفتاح hex."""
-        logger.info(f"فك تشفير {encrypted_db_path}...")
-        # التحقق من صحة المفتاح
-        if len(hex_key) != 64 or not all(c in '0123456789abcdefABCDEF' for c in hex_key):
-            raise ValueError("المفتاح يجب أن يكون 64 حرفًا hex (0-9, a-f).")
-        
-        # استخدام أداة wadecrypt من wa-crypt-tools
-        # wadecrypt <keyfile_or_hex> <encrypted> <decrypted>
-        cmd = ["wadecrypt", hex_key, encrypted_db_path, output_db_path]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info(f"تم فك التشفير بنجاح إلى {output_db_path}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"فشل فك التشفير: {e.stderr}")
-            raise RuntimeError(f"فشل فك التشفير: {e.stderr}")
-        except FileNotFoundError:
-            logger.error("أداة wadecrypt غير موجودة. تأكد من تثبيت wa-crypt-tools.")
-            raise
+        """Decrypt with upstream tooling, without forwarding potentially secret diagnostics."""
+        self._validate_key(hex_key)
+        self._run_crypto(["wadecrypt", hex_key, encrypted_db_path, output_db_path])
+        if not os.path.isfile(output_db_path):
+            raise RuntimeError("لم تُنتج أداة فك التشفير ملفًا.")
+        with open(output_db_path, "rb") as stream:
+            if stream.read(16) != b"SQLite format 3\x00":
+                raise RuntimeError("ناتج فك التشفير ليس قاعدة SQLite صالحة.")
 
     def encrypt_crypt15(self, db_path: str, output_crypt_path: str, hex_key: str = DEFAULT_HEX_KEY,
                         reference_crypt_path: Optional[str] = None) -> None:
-        """إعادة تشفير msgstore.db إلى msgstore.db.crypt15."""
-        logger.info(f"إعادة تشفير {db_path} إلى {output_crypt_path}...")
-        # استخدام أداة waencrypt من wa-crypt-tools
-        # waencrypt --reference <reference.crypt15> <keyfile> <decrypted> <encrypted>
-        if reference_crypt_path and os.path.exists(reference_crypt_path):
-            cmd = ["waencrypt", "--reference", reference_crypt_path, hex_key, db_path, output_crypt_path]
-        else:
-            # في حال عدم وجود ملف مرجعي، قد تحتاج لمعاملات إضافية (feature list, version, jid)
-            # هذا تنبيه: التشفير بدون مرجع قد لا يعمل بشكل موثوق في كل الإصدارات.
-            logger.warning("لا يوجد ملف مرجعي. محاولة التشفير بدون مرجع قد تفشل.")
-            cmd = ["waencrypt", hex_key, db_path, output_crypt_path]
-        
+        """Upstream beta encryption only; never manufacture a crypt15 header."""
+        self._validate_key(hex_key)
+        if not reference_crypt_path or not os.path.isfile(reference_crypt_path):
+            raise ValueError("التشفير يتطلب ملف crypt15 مرجعيًا؛ لا تُستخدم ترويسة تقديرية.")
+        self._run_crypto(["waencrypt", "--reference", reference_crypt_path,
+                          hex_key, db_path, output_crypt_path])
+        if not os.path.isfile(output_crypt_path) or os.path.getsize(output_crypt_path) == 0:
+            raise RuntimeError("لم تُنتج أداة التشفير ملفًا صالحًا للفحص.")
+
+    @staticmethod
+    def _validate_key(hex_key: str) -> None:
+        if len(hex_key) != 64 or not all(c in '0123456789abcdefABCDEF' for c in hex_key):
+            raise ValueError("المفتاح يجب أن يكون 64 حرفًا hex صالحًا.")
+
+    @staticmethod
+    def _run_crypto(command: list) -> None:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info(f"تم التشفير بنجاح إلى {output_crypt_path}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"فشل التشفير: {e.stderr}")
-            raise RuntimeError(f"فشل التشفير: {e.stderr}")
+            subprocess.run(command, capture_output=True, check=True, timeout=1800)
+        except FileNotFoundError:
+            raise RuntimeError("أداة wa-crypt-tools غير متوفرة في PATH.") from None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # Upstream errors can echo argv (including the full key). Never relay them.
+            raise RuntimeError("فشلت أداة التشفير أو انتهت المهلة؛ تحقق من المفتاح والملف محليًا.") from None
 
     # ---------- عمليات iOS (pymobiledevice3) ----------
 
@@ -228,35 +225,10 @@ class DeviceManager:
         return files
 
     def update_manifest_entry(self, backup_dir: str, file_hash: str, new_size: int, new_digest: bytes) -> None:
-        """
-        تحديث بيانات ملف في Manifest.db (الحجم والبصمة).
-        يُستخدم بعد تعديل محتوى ملف (مثل ChatStorage.sqlite).
-        """
-        manifest_path = self.get_ios_manifest_path(backup_dir)
-        conn = sqlite3.connect(manifest_path)
-        cursor = conn.cursor()
-        
-        # جلب البيانات الحالية للملف
-        cursor.execute("SELECT file FROM Files WHERE fileID = ?", (file_hash,))
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
+        """Use the same binary/NSKeyedArchiver-aware metadata updater everywhere."""
+        from ios_manifest_injector import IOSManifestInjector
+        if not IOSManifestInjector(backup_dir).update_entry(file_hash, new_size, new_digest):
             raise ValueError(f"الملف {file_hash} غير موجود في Manifest.db")
-        
-        # تحليل plist الموجود في العمود 'file'
-        file_data = plistlib.loads(row[0])
-        
-        # تحديث الحجم والبصمة
-        file_data['Size'] = new_size
-        file_data['Digest'] = new_digest
-        
-        # إعادة تحويله إلى plist وحفظه
-        new_plist = plistlib.dumps(file_data)
-        
-        cursor.execute("UPDATE Files SET file = ? WHERE fileID = ?", (new_plist, file_hash))
-        conn.commit()
-        conn.close()
-        logger.info(f"تم تحديث Manifest.db للملف {file_hash}")
 
     def calculate_ios_file_digest(self, file_path: str) -> Tuple[int, bytes]:
         """حساب الحجم وبصمة SHA-1 لملف (للاستخدام في Manifest.db)."""

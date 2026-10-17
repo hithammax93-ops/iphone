@@ -1,338 +1,292 @@
-# android_to_ios_converter.py
-import sqlite3
+"""Strict Android -> iOS candidate database conversion.
+
+This deliberately creates an *experimental candidate* using the small local
+schema below.  It is not a certified WhatsApp Core Data database and never
+modifies an iOS backup or its Manifest.db.
+"""
+import logging
 import os
 import shutil
-import logging
-import plistlib
-import hashlib
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
-from device_manager import DeviceManager, IOS_APP_DOMAIN, IOS_BUSINESS_APP_DOMAIN, IOS_CHATSTORAGE_PATH, IOS_MEDIA_DIR
+import sqlite3
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from device_manager import DeviceManager, IOS_MEDIA_DIR
 
 logger = logging.getLogger(__name__)
-
-# --- ثوابت التحويل الزمني ---
-# الفرق بين Unix Epoch (1970) و Apple Core Data Epoch (2001-01-01)
 APPLE_EPOCH_OFFSET = 978307200
 
-# --- خريطة أنواع الرسائل (تقديرية بناءً على ملاحظات المجتمع) ---
-# قد تختلف القيم بين إصدارات واتساب المختلفة، لذا يجب فحصها ديناميكيًا إن أمكن.
-# القيم الشائعة: 0=نص، 1=صورة، 2=صوت، 3=فيديو، 4=جهة اتصال، 5=موقع، 7=ملف، 8=ملصق، إلخ.
-# هذا مجرد مثال، الأفضل استخدام PRAGMA table_info والاستعلام عن القيم الفعلية.
 
 class AndroidToIOSConverter:
-    """
-    فئة لتحويل قاعدة بيانات واتساب من أندرويد (msgstore.db) إلى تنسيق iOS (ChatStorage.sqlite).
-    """
+    """Build a deterministic, integrity-checked experimental ChatStorage candidate."""
+
+    # Android message types for which this experimental schema can carry a file.
+    # Location/contact/etc. are deliberately rejected rather than misclassified.
+    FILE_BEARING_TYPES = frozenset({1, 2, 3, 6, 7})
 
     def __init__(self, device_manager: DeviceManager, hex_key: str):
         self.dm = device_manager
         self.hex_key = hex_key
-        self.temp_dir = None
+        self.temp_dir: Optional[str] = None
+        self.media_dir: Optional[str] = None
+        self.stats: Dict[str, int] = {}
 
-    def convert(self, android_db_path: str, android_media_path: str, ios_backup_dir: str,
-                is_business: bool = False, output_dir: Optional[str] = None) -> str:
-        """
-        عملية التحويل الكاملة:
-        1. فك تشفير قاعدة بيانات أندرويد (إذا كانت مشفرة)
-        2. تحليل مخطط قاعدة البيانات
-        3. إنشاء قاعدة بيانات iOS جديدة وملء الجداول
-        4. نسخ وتحويل الميديا
-        5. تحديث Manifest.db في النسخة الاحتياطية لـ iOS
-        """
-        logger.info("بدء عملية التحويل من أندرويد إلى iOS...")
-
-        # إنشاء مجلد عمل مؤقت
-        self.temp_dir = os.path.join(os.path.dirname(android_db_path), "temp_convert")
-        self.dm.ensure_dir(self.temp_dir)
-
-        # الخطوة 1: التأكد من فك تشفير قاعدة البيانات (إذا كانت .crypt15)
-        decrypted_db = android_db_path
-        if android_db_path.endswith('.crypt15'):
-            decrypted_db = os.path.join(self.temp_dir, "msgstore_decrypted.db")
-            self.dm.decrypt_crypt15(android_db_path, decrypted_db, self.hex_key)
-        elif not os.path.exists(android_db_path):
-            raise FileNotFoundError(f"قاعدة البيانات {android_db_path} غير موجودة.")
-
-        # الخطوة 2: تحليل مخطط قاعدة بيانات أندرويد
-        android_schema = self._analyze_android_schema(decrypted_db)
-        logger.info(f"تم تحليل مخطط أندرويد. الجداول: {list(android_schema.keys())}")
-
-        # الخطوة 3: إنشاء قاعدة بيانات iOS جديدة
-        ios_db_path = os.path.join(self.temp_dir, "ChatStorage.sqlite")
-        self._create_ios_database(ios_db_path, android_schema)
-        logger.info(f"تم إنشاء قاعدة بيانات iOS في {ios_db_path}")
-
-        # الخطوة 4: ملء البيانات
-        self._transfer_chats(decrypted_db, ios_db_path, android_schema, is_business)
-        self._transfer_messages(decrypted_db, ios_db_path, android_schema)
-        self._transfer_media(decrypted_db, ios_db_path, android_schema, android_media_path, ios_backup_dir, is_business)
-        logger.info("تم نقل جميع البيانات إلى ChatStorage.sqlite")
-
-        # الخطوة 5: تحديث Manifest.db في النسخة الاحتياطية
-        self._update_manifest_for_ios(ios_backup_dir, ios_db_path, is_business)
-        logger.info("تم تحديث Manifest.db.")
-
-        # نسخ قاعدة البيانات النهائية إلى مجلد الإخراج (إذا تم تحديده)
+    def convert(self, android_db_path: str, android_media_path: str,
+                ios_backup_dir: str, is_business: bool = False,
+                output_dir: Optional[str] = None) -> str:
+        """Convert into a fresh candidate; ``ios_backup_dir`` is intentionally read-only."""
+        del is_business  # retained for the public API
+        if not os.path.isfile(android_db_path):
+            raise FileNotFoundError(f"Android database not found: {android_db_path}")
         if output_dir:
-            final_path = os.path.join(output_dir, "ChatStorage.sqlite")
-            shutil.copy2(ios_db_path, final_path)
-            logger.info(f"تم نسخ ChatStorage.sqlite النهائي إلى {final_path}")
-
-        # تنظيف المجلد المؤقت (اختياري)
-        # self.dm.clean_temp_dir(self.temp_dir)
-        return ios_db_path
-
-    def _analyze_android_schema(self, db_path: str) -> Dict[str, List[Dict]]:
-        """
-        تحليل مخطط قاعدة بيانات أندرويد باستخدام PRAGMA table_info.
-        يعيد قاموسًا يحتوي على أسماء الجداول وأعمدتها.
-        """
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # الحصول على جميع أسماء الجداول
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [row[0] for row in cursor.fetchall()]
-        
-        schema = {}
-        for table in tables:
-            cursor.execute(f"PRAGMA table_info({table});")
-            columns = []
-            for col in cursor.fetchall():
-                # col: (cid, name, type, notnull, dflt_value, pk)
-                columns.append({
-                    'name': col[1],
-                    'type': col[2],
-                    'notnull': bool(col[3]),
-                    'pk': bool(col[5])
-                })
-            schema[table] = columns
-        
-        conn.close()
-        return schema
-
-    def _create_ios_database(self, ios_db_path: str, android_schema: Dict[str, List[Dict]]) -> None:
-        """
-        إنشاء قاعدة بيانات iOS جديدة بالجداول المطلوبة.
-        ملاحظة: هذا المخطط مبسط. قد تحتاج لإضافة المزيد من الأعمدة حسب إصدار iOS.
-        """
-        conn = sqlite3.connect(ios_db_path)
-        cursor = conn.cursor()
-        
-        # جدول ZWACHATSESSION
-        cursor.execute("""
-            CREATE TABLE ZWACHATSESSION (
-                Z_PK INTEGER PRIMARY KEY AUTOINCREMENT,
-                Z_ENT INTEGER,
-                Z_OPT INTEGER,
-                ZCONTACTJID TEXT,
-                ZLASTMESSAGEDATE REAL,
-                ZARCHIVED INTEGER,
-                ZUNREADCOUNT INTEGER,
-                ZMESSAGECOUNTER INTEGER
-            );
-        """)
-        
-        # جدول ZWAMESSAGE
-        cursor.execute("""
-            CREATE TABLE ZWAMESSAGE (
-                Z_PK INTEGER PRIMARY KEY AUTOINCREMENT,
-                Z_ENT INTEGER,
-                Z_OPT INTEGER,
-                ZCHATSESSION INTEGER,
-                ZMESSAGETYPE INTEGER,
-                ZTIMESTAMP REAL,
-                ZTEXT TEXT,
-                ZFROMJID TEXT,
-                ZTOJID TEXT,
-                ZMEDIAITEM INTEGER,
-                ZISFROMME INTEGER,
-                ZSENTDATE REAL,
-                FOREIGN KEY (ZCHATSESSION) REFERENCES ZWACHATSESSION(Z_PK),
-                FOREIGN KEY (ZMEDIAITEM) REFERENCES ZWAMEDIAITEM(Z_PK)
-            );
-        """)
-        
-        # جدول ZWAMEDIAITEM
-        cursor.execute("""
-            CREATE TABLE ZWAMEDIAITEM (
-                Z_PK INTEGER PRIMARY KEY AUTOINCREMENT,
-                Z_ENT INTEGER,
-                Z_OPT INTEGER,
-                ZMESSAGE INTEGER,
-                ZMEDIALOCALPATH TEXT,
-                ZTHUMBNAILLOCALPATH TEXT,
-                ZFILESIZE INTEGER,
-                ZMIME TYPE TEXT,
-                ZMEDIAURL TEXT
-            );
-        """)
-        
-        conn.commit()
-        conn.close()
-
-    def _convert_timestamp(self, android_timestamp_ms: int) -> float:
-        """
-        تحويل طابع زمني من أندرويد (Unix Epoch بالميلي ثانية) إلى تنسيق Apple Core Data (ثواني).
-        المعادلة: (android_timestamp_ms / 1000) - 978307200
-        """
-        # بعض قواعد بيانات أندرويد تخزن الطابع الزمني بالثواني، والبعض بالميلي ثانية.
-        # نفترض هنا أنه بالميلي ثانية. إذا كان بالثواني، يجب تعديل ذلك.
-        # يمكن التحقق من خلال فحص نطاق القيم.
-        android_timestamp_s = android_timestamp_ms / 1000.0 if android_timestamp_ms > 1e12 else android_timestamp_ms
-        return android_timestamp_s - APPLE_EPOCH_OFFSET
-
-    def _transfer_chats(self, android_db: str, ios_db: str, schema: Dict, is_business: bool) -> None:
-        """نقل المحادثات من جدول chat/jid في أندرويد إلى ZWACHATSESSION في iOS."""
-        android_conn = sqlite3.connect(android_db)
-        android_cursor = android_conn.cursor()
-        ios_conn = sqlite3.connect(ios_db)
-        ios_cursor = ios_conn.cursor()
-        
-        # تحديد اسم جدول المحادثات (قد يكون 'chat' أو 'jid')
-        chat_table = 'chat' if 'chat' in schema else 'jid'
-        if chat_table not in schema:
-            logger.warning("لم يتم العثور على جدول chat أو jid في قاعدة بيانات أندرويد.")
-            return
-        
-        # الحصول على الأعمدة المتاحة
-        android_cols = [c['name'] for c in schema[chat_table]]
-        # نفترض وجود عمود jid أو raw_string
-        jid_col = 'jid' if 'jid' in android_cols else 'raw_string' if 'raw_string' in android_cols else None
-        if not jid_col:
-            logger.error("لا يمكن العثور على عمود jid في جدول المحادثات.")
-            return
-        
-        # جلب المحادثات
-        android_cursor.execute(f"SELECT {jid_col}, _id FROM {chat_table};")
-        chats = android_cursor.fetchall()
-        
-        for jid, android_chat_id in chats:
-            # إدراج في ZWACHATSESSION
-            ios_cursor.execute("""
-                INSERT INTO ZWACHATSESSION (ZCONTACTJID, ZLASTMESSAGEDATE, ZARCHIVED, ZUNREADCOUNT, ZMESSAGECOUNTER)
-                VALUES (?, ?, ?, ?, ?)
-            """, (jid, 0.0, 0, 0, 0))
-            # يمكن لاحقًا تحديث ZLASTMESSAGEDATE بناءً على آخر رسالة
-        
-        ios_conn.commit()
-        android_conn.close()
-        ios_conn.close()
-        logger.info(f"تم نقل {len(chats)} محادثة.")
-
-    def _transfer_messages(self, android_db: str, ios_db: str, schema: Dict) -> None:
-        """نقل الرسائل من جدول message في أندرويد إلى ZWAMESSAGE في iOS."""
-        android_conn = sqlite3.connect(android_db)
-        android_cursor = android_conn.cursor()
-        ios_conn = sqlite3.connect(ios_db)
-        ios_cursor = ios_conn.cursor()
-        
-        if 'message' not in schema:
-            logger.warning("جدول message غير موجود.")
-            return
-        
-        android_cols = [c['name'] for c in schema['message']]
-        # تحديد الأعمدة المطلوبة
-        # نفترض وجود: _id, chat_row_id, from_me, timestamp, text_data, message_type, media_url, إلخ.
-        # قد تختلف الأسماء. نحاول التكيف.
-        
-        # جلب الرسائل (مبسط)
+            out_real = os.path.realpath(os.path.abspath(output_dir))
+            db_parent = os.path.realpath(os.path.dirname(os.path.abspath(android_db_path)))
+            db_real = os.path.realpath(os.path.abspath(android_db_path))
+            if os.path.commonpath([out_real, db_real]) == out_real:
+                raise ValueError("output_dir must not be the Android input directory")
+            for protected in (ios_backup_dir, android_media_path):
+                protected_real = os.path.realpath(os.path.abspath(protected))
+                if os.path.commonpath([out_real, protected_real]) in (protected_real, out_real):
+                    raise ValueError("output_dir must not be inside an input or iOS backup path")
+            if os.path.isdir(out_real):
+                unexpected = set(os.listdir(out_real)) - {"ChatStorage.sqlite", "Media", "migration_report.json"}
+                if unexpected:
+                    raise ValueError("output_dir contains unrelated files; refusing replacement")
+        self.temp_dir = tempfile.mkdtemp(prefix="temp_convert_")
+        self.media_dir = os.path.join(self.temp_dir, "Media")
+        staged = os.path.join(self.temp_dir, "ChatStorage.sqlite.staged")
         try:
-            android_cursor.execute("SELECT _id, chat_row_id, from_me, timestamp, text_data, message_type FROM message;")
-            messages = android_cursor.fetchall()
-        except sqlite3.OperationalError as e:
-            logger.error(f"فشل استعلام الرسائل: {e}. قد تحتاج لتعديل أسماء الأعمدة.")
-            return
-        
-        for msg in messages:
-            android_msg_id, chat_id, from_me, ts, text, msg_type = msg
-            # تحويل الطابع الزمني
-            apple_ts = self._convert_timestamp(ts)
-            # البحث عن Z_PK للمحادثة المقابلة (مبسط: نفترض التطابق)
-            # في الواقع، تحتاج لربط chat_id من أندرويد بـ Z_PK في iOS. هنا نبسط الأمر.
-            ios_cursor.execute("""
-                INSERT INTO ZWAMESSAGE (ZCHATSESSION, ZMESSAGETYPE, ZTIMESTAMP, ZTEXT, ZISFROMME)
-                VALUES (?, ?, ?, ?, ?)
-            """, (chat_id, msg_type, apple_ts, text, 1 if from_me else 0))
-        
-        ios_conn.commit()
-        android_conn.close()
-        ios_conn.close()
-        logger.info(f"تم نقل {len(messages)} رسالة.")
+            source_db = android_db_path
+            if str(android_db_path).lower().endswith(".crypt15"):
+                source_db = os.path.join(self.temp_dir, "decrypted.sqlite")
+                self.dm.decrypt_crypt15(android_db_path, source_db, self.hex_key)
+            schema = self._analyze_android_schema(source_db)
+            self._validate_schema(schema)
+            chat_map, chats = self._read_chats(source_db, schema)
+            messages = self._read_messages(source_db, schema, chat_map)
+            media_links = self._read_media_links(source_db, schema, messages)
+            self._create_ios_database(staged)
+            self._populate(staged, chats, messages, media_links, android_media_path)
+            self._validate_candidate(staged, len(chats), len(messages), len(media_links))
+            os.replace(staged, os.path.join(self.temp_dir, "ChatStorage.sqlite"))
+            candidate = os.path.join(self.temp_dir, "ChatStorage.sqlite")
+            if output_dir:
+                candidate = self._publish_candidate(candidate, output_dir)
+            self.stats = {"chats": len(chats), "messages": len(messages),
+                          "media": len(media_links)}
+            return candidate
+        except Exception:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            raise
+        finally:
+            decrypted = os.path.join(self.temp_dir, "decrypted.sqlite")
+            if os.path.exists(decrypted):
+                os.unlink(decrypted)
+            if output_dir:
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def _transfer_media(self, android_db: str, ios_db: str, schema: Dict,
-                         android_media_path: str, ios_backup_dir: str, is_business: bool) -> None:
-        """
-        نسخ ملفات الميديا من مجلد أندرويد إلى النسخة الاحتياطية لـ iOS،
-        وتسجيل المسارات في ZWAMEDIAITEM.
-        """
-        if not os.path.exists(android_media_path):
-            logger.warning(f"مجلد الميديا {android_media_path} غير موجود. تخطي نسخ الميديا.")
-            return
-        
-        # هنا يجب التنقل في مجلدات الميديا (WhatsApp Images, Video, Voice Notes, إلخ)
-        # ونسخ الملفات إلى المسار المناسب في iOS (Message/Media/...)
-        # ثم تحديث جدول ZWAMEDIAITEM.
-        # هذا الجزء معقد ويتطلب معرفة بنية مجلدات أندرويد الدقيقة.
-        # سنقدم هيكلًا عامًا.
-        
-        # مثال: نسخ جميع الملفات من مجلدات الميديا الشائعة
-        media_subdirs = ['WhatsApp Images', 'WhatsApp Video', 'WhatsApp Voice Notes', 'WhatsApp Documents']
-        for subdir in media_subdirs:
-            src_dir = os.path.join(android_media_path, subdir)
-            if not os.path.exists(src_dir):
-                continue
-            # في iOS، المسار النسبي داخل Message/Media
-            # على سبيل المثال: Message/Media/<JID>/<filename>
-            # نحتاج إلى JID لكل ملف، وهو ما يمكن الحصول عليه من جدول message/media.
-            # هذا يتطلب ربطًا معقدًا. هنا نكتفي بنسخ الملفات إلى مجلد عام.
-            dst_dir = os.path.join(ios_backup_dir, IOS_MEDIA_DIR, subdir)
-            self.dm.ensure_dir(dst_dir)
-            for filename in os.listdir(src_dir):
-                src_file = os.path.join(src_dir, filename)
-                if os.path.isfile(src_file):
-                    dst_file = os.path.join(dst_dir, filename)
-                    shutil.copy2(src_file, dst_file)
-                    # بعد النسخ، يجب إدراج سجل في ZWAMEDIAITEM مع المسار النسبي الصحيح.
-                    # (هذا الجزء يحتاج إلى استعلامات إضافية للحصول على JID ونوع الرسالة)
-        
-        logger.info("تم نسخ ملفات الميديا (بشكل مبسط).")
+    def _analyze_android_schema(self, db_path: str) -> Dict[str, List[Dict[str, Any]]]:
+        with sqlite3.connect(db_path) as conn:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+            return {t: [{"name": r[1], "type": r[2], "notnull": bool(r[3]), "pk": bool(r[5])}
+                        for r in conn.execute(f'PRAGMA table_info({self._quote(t)})')] for t in tables}
 
-    def _update_manifest_for_ios(self, ios_backup_dir: str, ios_db_path: str, is_business: bool) -> None:
-        """
-        تحديث Manifest.db ليعكس التغييرات في ChatStorage.sqlite.
-        """
-        domain = IOS_BUSINESS_APP_DOMAIN if is_business else IOS_APP_DOMAIN
-        relative_path = IOS_CHATSTORAGE_PATH
-        
-        # حساب SHA-1 المتوقع
-        combined = f"{domain}-{relative_path}"
-        file_hash = hashlib.sha1(combined.encode('utf-8')).hexdigest()
-        
-        # المسار الفعلي للملف في النسخة الاحتياطية
-        file_path = os.path.join(ios_backup_dir, file_hash[:2], file_hash)
-        
-        # نسخ قاعدة البيانات الجديدة إلى مكانها في النسخة الاحتياطية
-        self.dm.ensure_dir(os.path.dirname(file_path))
-        shutil.copy2(ios_db_path, file_path)
-        logger.info(f"تم نسخ ChatStorage.sqlite إلى {file_path}")
-        
-        # حساب الحجم والبصمة الجديدة
-        size, digest = self.dm.calculate_ios_file_digest(file_path)
-        
-        # تحديث Manifest.db
+    @staticmethod
+    def _quote(identifier):
+        return '"' + str(identifier).replace('"', '""') + '"'
+
+    @staticmethod
+    def _cols(schema, table):
+        return {c["name"] for c in schema.get(table, [])}
+
+    def _validate_schema(self, schema):
+        required = {
+            "chat": {"_id"},
+            "message": {"_id", "chat_row_id", "from_me", "timestamp", "text_data", "message_type"},
+        }
+        for table, cols in required.items():
+            if table not in schema:
+                raise ValueError(f"Unsupported Android schema: missing table {table}")
+            missing = cols - self._cols(schema, table)
+            if missing:
+                raise ValueError(f"Unsupported Android schema: {table} missing columns {sorted(missing)}")
+        chat_cols = self._cols(schema, "chat")
+        if not ({"jid", "raw_string", "jid_row_id"} & chat_cols):
+            raise ValueError("Unsupported chat schema: expected chat.jid, chat.raw_string, or chat.jid_row_id")
+        if "jid_row_id" in chat_cols:
+            if "jid" not in schema:
+                raise ValueError("chat.jid_row_id requires jid table")
+            if "_id" not in self._cols(schema, "jid"):
+                raise ValueError("jid table missing required _id for chat join")
+            if not ({"jid", "raw_string"} & self._cols(schema, "jid")):
+                raise ValueError("jid table lacks jid/raw_string")
+        if "message_media" in schema:
+            mc = self._cols(schema, "message_media")
+            if not ({"message_row_id", "message_id", "message_id"} & mc):
+                raise ValueError("Unsupported message_media schema: missing message link")
+            if not ({"file_path", "media_path", "path", "local_path"} & mc):
+                raise ValueError("Unsupported message_media schema: missing media path")
+
+    def _read_chats(self, db_path, schema):
+        cols = self._cols(schema, "chat")
+        if "jid" in cols:
+            jid_expr = 'c."jid"'
+            sql = 'SELECT c."_id", c."jid" FROM "chat" c ORDER BY c."_id"'
+        elif "raw_string" in cols:
+            jid_expr = 'c."raw_string"'
+            sql = 'SELECT c."_id", c."raw_string" FROM "chat" c ORDER BY c."_id"'
+        else:
+            jcol = "jid" if "jid" in self._cols(schema, "jid") else "raw_string"
+            sql = f'SELECT c."_id", j.{self._quote(jcol)} FROM "chat" c LEFT JOIN "jid" j ON j."_id" = c."jid_row_id" ORDER BY c."_id"'
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(sql).fetchall()
+        if not rows:
+            raise ValueError("Android schema contains zero chats; refusing silent empty conversion")
+        seen = set(); chat_map = {}; chats = []
+        for aid, jid in rows:
+            if aid is None:
+                raise ValueError("Chat has null id")
+            if jid is None or not str(jid):
+                raise ValueError(f"Chat {aid} has unmatched or empty JID")
+            if aid in seen or str(jid) in {x[1] for x in chats}:
+                raise ValueError("Duplicate Android chat id or JID")
+            seen.add(aid); chat_map[aid] = len(chats) + 1; chats.append((aid, str(jid)))
+        return chat_map, chats
+
+    def _read_messages(self, db_path, schema, chat_map):
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute('SELECT "_id","chat_row_id","from_me","timestamp","text_data","message_type" FROM "message" ORDER BY "_id"').fetchall()
+        if not rows:
+            raise ValueError("Android schema contains zero messages; refusing silent empty conversion")
+        result = []
+        ids = set()
+        for aid, chat_id, from_me, ts, text, typ in rows:
+            if aid in ids or aid is None: raise ValueError("Duplicate/null Android message id")
+            if chat_id not in chat_map: raise ValueError(f"Orphan message {aid}: chat {chat_id} not found")
+            if ts is None: raise ValueError(f"Message {aid} has null timestamp")
+            ids.add(aid); result.append((aid, chat_map[chat_id], int(bool(from_me)), self._convert_timestamp(ts), text, typ))
+        return result
+
+    def _read_media_links(self, db_path, schema, messages):
+        unsupported = sorted({m[5] for m in messages if m[5] not in (None, 0) and m[5] not in self.FILE_BEARING_TYPES})
+        if unsupported:
+            raise ValueError(f"Unsupported non-file message type(s): {unsupported}")
+        if "message_media" not in schema:
+            # A non-text message without an explicit relation cannot be certified.
+            if any(m[5] not in (None, 0) for m in messages):
+                raise ValueError("Media messages require a supported message_media table")
+            return []
+        cols = self._cols(schema, "message_media")
+        mid = "message_row_id" if "message_row_id" in cols else "message_id"
+        pathcol = next(c for c in ("file_path", "media_path", "path", "local_path") if c in cols)
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(f'SELECT "{mid}","{pathcol}" FROM "message_media"').fetchall()
+        known = {m[0] for m in messages}; links = []
+        for message_id, path in rows:
+            if message_id not in known: raise ValueError(f"Orphan media link for message {message_id}")
+            if not path: raise ValueError(f"Missing media path for message {message_id}")
+            links.append((message_id, str(path)))
+        linked = {message_id for message_id, _ in links}
+        missing = [m[0] for m in messages if m[5] in self.FILE_BEARING_TYPES and m[0] not in linked]
+        if missing:
+            raise ValueError(f"Media messages have no media link: {missing}")
+        return links
+
+    def _publish_candidate(self, candidate, output_dir):
+        """Publish DB and Media as one fresh bundle, removing stale prior media."""
+        output_dir = os.path.realpath(os.path.abspath(output_dir))
+        parent = os.path.dirname(output_dir)
+        os.makedirs(parent, exist_ok=True)
+        stage = tempfile.mkdtemp(prefix=".candidate-", dir=parent)
+        old = None
         try:
-            self.dm.update_manifest_entry(ios_backup_dir, file_hash, size, digest)
-        except ValueError as e:
-            logger.warning(f"لم يتم العثور على الملف {file_hash} في Manifest.db. قد تحتاج إلى إضافته.")
-            # في حالة عدم وجود الملف، يجب إضافته (أكثر تعقيدًا، يتطلب إنشاء plist كامل)
-            # هذا الجزء متروك للجزء الثاني من المشروع (ios_manifest_injector.py)
+            shutil.copy2(candidate, os.path.join(stage, "ChatStorage.sqlite"))
+            shutil.copytree(self.media_dir, os.path.join(stage, "Media"))
+            if os.path.exists(output_dir):
+                old = tempfile.mkdtemp(prefix=".old-candidate-", dir=parent)
+                os.rmdir(old)
+                os.replace(output_dir, old)
+            os.replace(stage, output_dir)
+            self.media_dir = os.path.join(output_dir, "Media")
+            if old:
+                shutil.rmtree(old, ignore_errors=True)
+            return os.path.join(output_dir, "ChatStorage.sqlite")
+        except Exception:
+            if old and not os.path.exists(output_dir):
+                os.replace(old, output_dir)
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
 
+    @staticmethod
+    def _convert_timestamp(value):
+        value = float(value)
+        return (value / 1000.0 if value > 1e12 else value) - APPLE_EPOCH_OFFSET
 
-# مثال للاستخدام (للتجربة فقط)
-if __name__ == "__main__":
-    dm = DeviceManager()
-    converter = AndroidToIOSConverter(dm, hex_key="0"*64)  # استبدل المفتاح الفعلي
-    # converter.convert("/path/to/msgstore.db", "/path/to/android/media", "/path/to/ios/backup")
-    print("AndroidToIOSConverter جاهز للاستخدام.")
+    def _create_ios_database(self, path):
+        with sqlite3.connect(path) as c:
+            c.execute("PRAGMA foreign_keys=ON")
+            c.executescript("""
+              CREATE TABLE ZWACHATSESSION (Z_PK INTEGER PRIMARY KEY, ZCONTACTJID TEXT NOT NULL UNIQUE,
+                ZLASTMESSAGEDATE REAL NOT NULL, ZARCHIVED INTEGER NOT NULL, ZUNREADCOUNT INTEGER NOT NULL,
+                ZMESSAGECOUNTER INTEGER NOT NULL);
+              CREATE TABLE ZWAMESSAGE (Z_PK INTEGER PRIMARY KEY, ZANDROIDID INTEGER NOT NULL UNIQUE,
+                ZCHATSESSION INTEGER NOT NULL REFERENCES ZWACHATSESSION(Z_PK), ZMESSAGETYPE INTEGER,
+                ZTIMESTAMP REAL NOT NULL, ZTEXT TEXT, ZFROMJID TEXT, ZTOJID TEXT, ZMEDIAITEM INTEGER,
+                ZISFROMME INTEGER NOT NULL, ZSENTDATE REAL, FOREIGN KEY(ZMEDIAITEM) REFERENCES ZWAMEDIAITEM(Z_PK));
+              CREATE TABLE ZWAMEDIAITEM (Z_PK INTEGER PRIMARY KEY, ZANDROIDID INTEGER NOT NULL,
+                ZMESSAGE INTEGER NOT NULL REFERENCES ZWAMESSAGE(Z_PK), ZMEDIALOCALPATH TEXT NOT NULL,
+                ZTHUMBNAILLOCALPATH TEXT, ZFILESIZE INTEGER NOT NULL, ZMIMETYPE TEXT, ZMEDIAURL TEXT);
+            """)
+
+    def _media_source(self, root, raw):
+        root = os.path.realpath(os.path.abspath(root))
+        if not os.path.isdir(root): raise FileNotFoundError(f"Media root not found: {root}")
+        p = str(raw).replace('\\', '/')
+        if os.path.isabs(p): candidate = os.path.realpath(p)
+        else:
+            while p.startswith('./'): p = p[2:]
+            for prefix in ("WhatsApp/Media/", "Media/"):
+                if p.startswith(prefix): p = p[len(prefix):]; break
+            base = os.path.join(root, "Media") if os.path.isdir(os.path.join(root, "Media")) else root
+            candidate = os.path.realpath(os.path.join(base, p))
+        if os.path.commonpath([root, candidate]) != root or os.path.islink(os.path.abspath(candidate)):
+            raise ValueError(f"Media path escapes media root: {raw}")
+        if not os.path.isfile(candidate): raise FileNotFoundError(f"Linked media file missing: {raw}")
+        return candidate
+
+    def _populate(self, path, chats, messages, links, media_root):
+        os.makedirs(self.media_dir, exist_ok=True)
+        with sqlite3.connect(path) as c:
+            c.execute("PRAGMA foreign_keys=ON")
+            for ios_id, (_, jid) in enumerate(chats, 1):
+                c.execute("INSERT INTO ZWACHATSESSION VALUES (?,?,?,?,?,?)", (ios_id, jid, 0.0, 0, 0, 0))
+            msg_map = {}
+            for ios_id, (aid, chat, frm, ts, text, typ) in enumerate(messages, 1):
+                c.execute("INSERT INTO ZWAMESSAGE (Z_PK,ZANDROIDID,ZCHATSESSION,ZMESSAGETYPE,ZTIMESTAMP,ZTEXT,ZISFROMME,ZSENTDATE) VALUES (?,?,?,?,?,?,?,?)", (ios_id, aid, chat, typ, ts, text, frm, ts))
+                msg_map[aid] = ios_id
+            media_by_msg = {}
+            for media_id, (aid, raw) in enumerate(links, 1):
+                src = self._media_source(media_root, raw)
+                rel = os.path.relpath(src, os.path.realpath(os.path.join(media_root, "Media") if os.path.isdir(os.path.join(media_root, "Media")) else media_root))
+                dst = os.path.join(self.media_dir, rel); os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+                ios_msg = msg_map[aid]; size = os.path.getsize(src)
+                c.execute("INSERT INTO ZWAMEDIAITEM (Z_PK,ZANDROIDID,ZMESSAGE,ZMEDIALOCALPATH,ZFILESIZE) VALUES (?,?,?,?,?)", (media_id, aid, ios_msg, os.path.join(IOS_MEDIA_DIR, rel).replace('\\','/'), size))
+                media_by_msg.setdefault(ios_msg, []).append(media_id)
+            for msg, media_ids in media_by_msg.items():
+                c.execute("UPDATE ZWAMESSAGE SET ZMEDIAITEM=? WHERE Z_PK=?", (media_ids[0], msg))
+            c.execute("""UPDATE ZWACHATSESSION AS cs SET
+                ZMESSAGECOUNTER=(SELECT count(*) FROM ZWAMESSAGE AS m WHERE m.ZCHATSESSION=cs.Z_PK),
+                ZLASTMESSAGEDATE=COALESCE((SELECT max(m.ZTIMESTAMP) FROM ZWAMESSAGE AS m WHERE m.ZCHATSESSION=cs.Z_PK),0)
+            """)
+            c.commit()
+
+    def _validate_candidate(self, path, chats, messages, media):
+        with sqlite3.connect(path) as c:
+            c.execute("PRAGMA foreign_keys=ON")
+            if c.execute("PRAGMA foreign_key_check").fetchone(): raise ValueError("Candidate foreign-key check failed")
+            counts = [c.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("ZWACHATSESSION", "ZWAMESSAGE", "ZWAMEDIAITEM")]
+            if counts != [chats, messages, media]: raise ValueError(f"Candidate count mismatch: {counts}")
+            if c.execute("SELECT count(*) FROM ZWAMESSAGE WHERE ZCHATSESSION NOT IN (SELECT Z_PK FROM ZWACHATSESSION)").fetchone()[0]: raise ValueError("Orphan candidate message")

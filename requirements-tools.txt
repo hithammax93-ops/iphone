@@ -1,0 +1,6 @@
+# Optional external commands: wadecrypt, waencrypt (upstream encryption is beta).
+wa-crypt-tools
+# Optional device operations; not needed for offline candidate generation.
+pymobiledevice3
+# Optional packaging; external tool executables are NOT bundled automatically.
+pyinstaller

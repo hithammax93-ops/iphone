@@ -14,9 +14,14 @@ import shlex
 import sqlite3
 import subprocess
 import tempfile
+import queue
+import threading
+import time
+from collections import deque
+import codecs
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 
 _PACKAGES = {False: "com.whatsapp", True: "com.whatsapp.w4b"}
@@ -27,9 +32,12 @@ _ADB_ROOTS = {False: ("/sdcard/Android/media/com.whatsapp/WhatsApp", "/sdcard/Wh
 class AndroidBackup:
     """Perform a bounded, read-only backup of shared WhatsApp files through ADB."""
 
-    def __init__(self, adb_path: str = "adb", timeout: int = 60):
+    def __init__(self, adb_path: str = "adb", timeout: int = 60, idle_timeout: float = 120.0, hard_timeout: float = 7200.0, on_progress: Optional[Callable[[dict[str, Any]], None]] = None):
         self.adb_path = adb_path
         self.timeout = timeout
+        self.idle_timeout = float(idle_timeout)
+        self.hard_timeout = float(hard_timeout)
+        self.on_progress = on_progress
 
     @staticmethod
     def _now() -> str:
@@ -89,7 +97,15 @@ class AndroidBackup:
             # Device enumeration remains useful even when optional metadata times out.
             return
 
-    def check_devices(self) -> dict[str, Any]:
+    @staticmethod
+    def _progress(callback: Optional[Callable[[dict[str, Any]], None]], event: dict[str, Any]) -> None:
+        if callback:
+            try:
+                callback(event)
+            except Exception:
+                pass
+
+    def check_devices(self, include_metadata: bool = True, on_progress: Optional[Callable[[dict[str, Any]], None]] = None) -> dict[str, Any]:
         """Return ADB availability and all devices reported by ``adb devices -l``."""
         result: dict[str, Any] = {"devices": [], "adb_available": False, "checked_at": self._now()}
         try:
@@ -107,8 +123,10 @@ class AndroidBackup:
                 result["adb_error"] = proc.stderr.strip()
             return result
         devices = self._parse_devices(proc.stdout)
-        for item in devices:
-            if item["state"] == "device":
+        for index, item in enumerate(devices):
+            if on_progress and index % 10 == 0:
+                self._progress(on_progress, {"stage": "inventory", "message": f"تم تعداد {index + 1} جهازًا", "index": index})
+            if include_metadata and item["state"] == "device":
                 self._metadata(item)
         result["devices"] = devices
         return result
@@ -124,9 +142,10 @@ class AndroidBackup:
         except (OSError, sqlite3.Error):
             return False
 
-    @staticmethod
-    def _inventory(root: Path) -> list[dict[str, Any]]:
+    def _inventory(self, root: Path, on_progress: Optional[Callable[[dict[str, Any]], None]] = None) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
+        hashed = 0
+        last_report = time.monotonic()
         for path in sorted(p for p in root.rglob("*") if p.is_file()):
             digest = hashlib.sha256()
             size = 0
@@ -134,31 +153,143 @@ class AndroidBackup:
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     size += len(block)
                     digest.update(block)
+                    hashed += len(block)
+                    now = time.monotonic()
+                    if on_progress and now - last_report >= 2.0:
+                        self._progress(on_progress, {"stage": "inventory", "message": f"فحص SHA-256: {hashed} بايت", "bytes_hashed": hashed})
+                        last_report = now
             entries.append({"path": path.relative_to(root).as_posix(), "bytes": size,
                             "sha256": digest.hexdigest()})
+        if on_progress:
+            self._progress(on_progress, {"stage": "inventory", "message": f"اكتمل فحص SHA-256: {hashed} بايت", "bytes_hashed": hashed})
         return entries
 
-    def _pull(self, serial: str, remote: str, local: Path) -> tuple[bool, str]:
-        # ADB nests a source directory inside an existing destination directory.
-        # Leave destination absent so its contents land at exactly local/.
+    def _pull(self, serial: str, remote: str, local: Path,
+              on_progress: Optional[Callable[[dict[str, Any]], None]] = None) -> tuple[bool, str]:
+        """Stream adb pull without PIPE deadlocks; heartbeat is never activity."""
+        on_progress = on_progress or self.on_progress
         local.parent.mkdir(parents=True, exist_ok=True)
+        argv = [self.adb_path, "-s", serial, "pull", remote, str(local)]
         try:
-            proc = self._run([self.adb_path, "-s", serial, "pull", remote, str(local)], timeout=7200)
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=False, bufsize=0)
         except FileNotFoundError:
             return False, self._missing_adb()
         except subprocess.TimeoutExpired:
             return False, "انتهت مهلة ADB أثناء سحب البيانات."
+        except OSError as exc:
+            return False, f"تعذر تشغيل ADB: {exc}"
+
+        events: queue.Queue[tuple[str, bytes]] = queue.Queue(maxsize=128)
+        def reader(stream: Any, kind: str) -> None:
+            try:
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    # A noisy adb diagnostic must not block process supervision forever.
+                    try:
+                        events.put((kind, chunk), timeout=0.25)
+                    except queue.Full:
+                        pass
+            finally:
+                try:
+                    events.put((kind, b""), timeout=1.0)
+                except queue.Full:
+                    pass
+                close = getattr(stream, "close", None)
+                if close:
+                    try: close()
+                    except OSError: pass
+        threads = [threading.Thread(target=reader, args=(proc.stdout, "stdout"), daemon=True),
+                   threading.Thread(target=reader, args=(proc.stderr, "stderr"), daemon=True)]
+        for thread in threads: thread.start()
+        output: deque[str] = deque()
+        output_bytes = 0
+        decoders = {"stdout": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+                    "stderr": codecs.getincrementaldecoder("utf-8")(errors="replace")}
+        last_activity = time.monotonic()
+        started = last_heartbeat = time.monotonic()
+        last_size = -1
+        last_scan = 0.0
+        streams_done = 0
+        try:
+            while True:
+                now = time.monotonic()
+                if now - last_scan >= 2.0:
+                    size = self._tree_size(local)
+                    last_scan = now
+                    if size != last_size:
+                        last_size, last_activity = size, now
+                        self._progress(on_progress, {"stage": "pull", "message": f"سحب {size} بايت", "bytes": size, "remote": remote})
+                try:
+                    kind, chunk = events.get(timeout=min(0.25, max(0.05, 2.0 - (now-last_heartbeat))))
+                    if chunk:
+                        last_activity = time.monotonic()
+                        text = decoders[kind].decode(chunk, final=False)
+                        if text:
+                            encoded = text.encode("utf-8", errors="replace")
+                            output_bytes += len(encoded)
+                            output.append(text)
+                            while output_bytes > 16 * 1024 and output:
+                                output_bytes -= len(output.popleft().encode("utf-8", errors="replace"))
+                            self._progress(on_progress, {"stage": "pull", "message": text.strip(), "output": text[:4096], "remote": remote})
+                    else:
+                        streams_done += 1
+                        tail = decoders[kind].decode(b"", final=True)
+                        if tail:
+                            output.append(tail)
+                except queue.Empty:
+                    pass
+                now = time.monotonic()
+                if now - last_heartbeat >= 2.0:
+                    self._progress(on_progress, {"stage": "heartbeat", "message": "ما زال سحب البيانات جاريًا", "remote": remote})
+                    last_heartbeat = now
+                if proc.poll() is not None and streams_done >= 2 and events.empty():
+                    break
+                if now - started >= self.hard_timeout:
+                    raise TimeoutError("hard")
+                if now - last_activity >= self.idle_timeout:
+                    raise TimeoutError("idle")
+        except TimeoutError as exc:
+            try: proc.kill()
+            except OSError: pass
+            try: proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired): pass
+            return False, ("انتهت مهلة التوقف أثناء سحب البيانات." if str(exc) == "idle" else "انتهت المهلة القصوى لـ ADB أثناء سحب البيانات.")
+        finally:
+            for thread in threads: thread.join(timeout=1)
+            for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+                close = getattr(stream, "close", None)
+                if close:
+                    try: close()
+                    except OSError: pass
         if proc.returncode != 0:
-            return False, (proc.stderr or proc.stdout or "فشل adb pull").strip()
+            return False, ("".join(output).strip() or f"فشل adb pull (رمز الخروج {proc.returncode})")
         return True, ""
 
-    def backup(self, serial: str, destination: str | os.PathLike[str], is_business: bool = False) -> dict[str, Any]:
+    @staticmethod
+    def _tree_size(path: Path) -> int:
+        total = 0
+        try:
+            if path.is_file(): return path.stat().st_size
+            if path.exists():
+                for item in path.rglob("*"):
+                    if item.is_file():
+                        try: total += item.stat().st_size
+                        except OSError: pass
+        except OSError:
+            pass
+        return total
+
+    def backup(self, serial: str, destination: str | os.PathLike[str], is_business: bool = False, on_progress: Optional[Callable[[dict[str, Any]], None]] = None) -> dict[str, Any]:
         """Copy shared WhatsApp data for one explicitly selected, authorized device.
 
         The returned manifest is written even for failed/incomplete pulls. No existing
         destination is overwritten; each attempt gets a new directory.
         """
         started = self._now()
+        on_progress = on_progress or self.on_progress
         base: Optional[Path] = None
         result: dict[str, Any] = {"backup_dir": None, "manifest": None, "android_db": None,
                                   "android_media": None, "status": "failed", "conversion_ready": False,
@@ -175,7 +306,8 @@ class AndroidBackup:
             result["errors"].append(f"وجهة النسخ غير صالحة: {exc}")
             return result
 
-        checked = self.check_devices()
+        self._progress(on_progress, {"stage": "inventory", "message": "فحص الأجهزة"})
+        checked = self.check_devices(include_metadata=False, on_progress=on_progress)
         result["adb_available"] = checked.get("adb_available", False)
         if not checked.get("adb_available"):
             result["errors"].append(checked.get("error", self._missing_adb()))
@@ -213,13 +345,19 @@ class AndroidBackup:
         pulled: set[str] = set()
         if remote_root:
             for name in ("Databases", "Media"):
-                ok, error = self._pull(serial, f"{remote_root}/{name}", base / name)
+                self._progress(on_progress, {"stage": "pull", "message": f"بدء سحب {name}", "name": name})
+                ok, error = self._pull(serial, f"{remote_root}/{name}", base / name, on_progress=on_progress)
                 if ok:
                     pulled.add(name)
                 else:
                     errors.append(f"فشل سحب {name}: {error}")
 
-        entries = self._inventory(base)
+        self._progress(on_progress, {"stage": "inventory", "message": "فحص الملفات المحلية"})
+        try:
+            entries = self._inventory(base, on_progress=on_progress)
+        except OSError as exc:
+            entries = []
+            errors.append(f"تعذر فحص الملفات المحلية (خطأ قرص/صلاحيات): {exc}")
         db_dir, media_dir = base / "Databases", base / "Media"
         db_files = [p for p in db_dir.rglob("*") if p.is_file()] if db_dir.exists() else []
         media_files = [p for p in media_dir.rglob("*") if p.is_file()] if media_dir.exists() else []

@@ -63,6 +63,7 @@ def test_backup_rejects_unauthorized_and_requires_explicit_serial(tmp_path):
 
 def test_backup_pulls_only_selected_serial_and_creates_manifest(tmp_path):
     calls = []
+    pull_calls = []
 
     def run(argv, **kwargs):
         calls.append(argv)
@@ -89,7 +90,19 @@ def test_backup_pulls_only_selected_serial_and_creates_manifest(tmp_path):
             return completed("pull complete")
         raise AssertionError(argv)
 
-    with patch("android_backup.subprocess.run", side_effect=run):
+    def popen(argv, **kwargs):
+        pull_calls.append(argv)
+        local = Path(argv[-1]); remote = argv[4]
+        assert not local.exists(), "ADB would nest source inside existing destination"
+        local.mkdir(parents=True, exist_ok=True)
+        if remote.endswith("/Databases"):
+            with sqlite3.connect(local / "msgstore.db") as conn:
+                conn.execute("CREATE TABLE chat (_id INTEGER PRIMARY KEY)")
+        else:
+            (local / "image.jpg").write_bytes(b"media")
+        return _FakePull(chunks=(b"pull complete",))
+
+    with patch("android_backup.subprocess.run", side_effect=run), patch("android_backup.subprocess.Popen", side_effect=popen):
         result = AndroidBackup().backup("SAFE", tmp_path)
     assert result["status"] == "success"
     assert result["conversion_ready"] is True
@@ -97,7 +110,6 @@ def test_backup_pulls_only_selected_serial_and_creates_manifest(tmp_path):
     manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
     assert manifest["status"] == "success"
     assert any(entry["sha256"] for entry in manifest["files"])
-    pull_calls = [c for c in calls if len(c) > 3 and c[3] == "pull"]
     assert pull_calls and all(c[2] == "SAFE" for c in pull_calls)
     assert "EVIL" not in " ".join(" ".join(c) for c in pull_calls)
 
@@ -151,7 +163,15 @@ def test_encrypted_database_never_claims_conversion_ready(tmp_path):
             return completed()
         raise AssertionError(argv)
 
-    with patch("android_backup.subprocess.run", side_effect=run):
+    def popen(argv, **kwargs):
+        local = Path(argv[-1]); local.mkdir(parents=True, exist_ok=True)
+        if argv[4].endswith("/Databases"):
+            (local / "msgstore.db.crypt15").write_bytes(b"encrypted")
+        else:
+            (local / "x.jpg").write_bytes(b"media")
+        return _FakePull()
+
+    with patch("android_backup.subprocess.run", side_effect=run), patch("android_backup.subprocess.Popen", side_effect=popen):
         result = AndroidBackup().backup("A", tmp_path)
     assert result["status"] == "success"
     assert result["conversion_ready"] is False
@@ -182,7 +202,7 @@ def test_business_path_is_shell_quoted(tmp_path):
 
 
 def test_pull_timeout_is_reported_as_failure(tmp_path):
-    with patch('android_backup.subprocess.run', side_effect=subprocess.TimeoutExpired(['adb'], 7200)):
+    with patch('android_backup.subprocess.Popen', side_effect=subprocess.TimeoutExpired(['adb'], 7200)):
         ok, error = AndroidBackup()._pull('A', '/fixed/Media', tmp_path / 'Media')
     assert not ok
     assert 'مهلة' in error
@@ -193,3 +213,57 @@ def test_missing_serial_never_executes_adb(tmp_path):
         result = AndroidBackup().backup('', tmp_path)
     assert result['status'] == 'failed'
     adb.assert_not_called()
+
+class _FakeStream:
+    def __init__(self, chunks):
+        self.chunks = iter(chunks)
+    def readline(self):
+        try: return next(self.chunks)
+        except StopIteration: return b""
+    def read(self, size=-1):
+        return self.readline()
+    def close(self):
+        pass
+
+class _FakePull:
+    def __init__(self, chunks=(b"progress ", b"\xff\n"), returncode=0, local=None):
+        self.stdout = _FakeStream(chunks)
+        self.stderr = _FakeStream(())
+        self.returncode = returncode
+        self.killed = False
+        if local is not None:
+            Path(local).mkdir(parents=True, exist_ok=True)
+            (Path(local) / "part.bin").write_bytes(b"partial")
+    def poll(self): return self.returncode
+    def wait(self, timeout=None): return self.returncode
+    def kill(self): self.killed = True
+
+def test_pull_streams_utf8_replace_and_reports_progress(tmp_path):
+    events = []
+    fake = _FakePull(local=tmp_path / "Media")
+    with patch("android_backup.subprocess.Popen", return_value=fake):
+        ok, error = AndroidBackup(idle_timeout=1)._pull("A", "/remote/Media", tmp_path / "Media", events.append)
+    assert ok and not error
+    assert any(e.get("stage") == "pull" and "�" in e.get("message", "") for e in events)
+    assert any(e.get("bytes") == 7 for e in events)
+
+def test_pull_nonzero_keeps_error_and_partial_files(tmp_path):
+    fake = _FakePull(chunks=(b"device disconnected\n",), returncode=7, local=tmp_path / "Media")
+    with patch("android_backup.subprocess.Popen", return_value=fake):
+        ok, error = AndroidBackup()._pull("A", "/remote/Media", tmp_path / "Media")
+    assert not ok and "device disconnected" in error
+    assert (tmp_path / "Media" / "part.bin").exists()
+
+def test_pull_idle_timeout_kills_process_but_heartbeat_is_not_activity(tmp_path):
+    class Stalled(_FakePull):
+        def __init__(self):
+            self.stdout = _FakeStream(())
+            self.stderr = _FakeStream(())
+            self.returncode = None
+            self.killed = False
+        def poll(self): return None
+    fake = Stalled()
+    events = []
+    with patch("android_backup.subprocess.Popen", return_value=fake):
+        ok, error = AndroidBackup(idle_timeout=2.1, hard_timeout=4)._pull("A", "/remote/Media", tmp_path / "Media", events.append)
+    assert not ok and "التوقف" in error and fake.killed

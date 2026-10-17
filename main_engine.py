@@ -171,7 +171,10 @@ def main(argv: Optional[list] = None) -> int:
             if not args.android_serial or not args.backup_dir:
                 raise ValueError("حدد جهاز أندرويد ومجلد حفظ النسخة على اللابتوب.")
             ProgressEmitter.step("backup", "نسخ ملفات واتساب المشتركة من أندرويد إلى اللابتوب...", 10)
-            result = AndroidBackup(resolve_adb()).backup(args.android_serial, args.backup_dir,
+            def backup_progress(event):
+                ProgressEmitter._emit({**event, "type": "backup_progress"})
+
+            result = AndroidBackup(resolve_adb(), on_progress=backup_progress).backup(args.android_serial, args.backup_dir,
                                                         args.whatsapp_type == "business")
             if result.get("status") != "success":
                 ProgressEmitter._emit({**result, "type": "backup", "message":

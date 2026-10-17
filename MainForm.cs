@@ -40,6 +40,7 @@ namespace WhatsAppMigrator
         private bool _terminalEventSeen;
         private bool _backupAttempted;
         private bool _backupReady;
+        private bool _cancelRequested;
         private int _pendingUiCallbacks;
         private TaskCompletionSource<bool>? _uiDrain;
 
@@ -53,11 +54,12 @@ namespace WhatsAppMigrator
 
         public MainForm()
         {
-            Text = "WhatsApp Migrator — أدوات أندرويد ومرشح تجريبي";
+            Text = "WhatsApp Migrator — CopyProgressFix 2 — أدوات أندرويد";
             Width = 1180; Height = 820; MinimumSize = new Size(980, 700);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Theme.Background; ForeColor = Theme.TextPrimary; Font = Theme.LabelFont;
             BuildUI();
+            FormClosing += (_, _) => { try { if (_engineProcess != null && !_engineProcess.HasExited) _engineProcess.Kill(true); } catch { } };
         }
 
         private void BuildUI()
@@ -104,6 +106,7 @@ namespace WhatsAppMigrator
             ConfigureButton(_backupBtn, "2  نسخ أندرويد إلى اللابتوب", Theme.NeonGreen); _backupBtn.Click += async (_, _) => await RunOperationAsync("backup_android"); actions.Controls.Add(_backupBtn);
             ConfigureButton(_candidateBtn, "3  إنشاء مرشح تحويل", Theme.NeonPurple); _candidateBtn.Click += async (_, _) => await RunOperationAsync("android_to_ios"); actions.Controls.Add(_candidateBtn);
             ConfigureButton(_cancelBtn, "إلغاء", Theme.NeonRed); _cancelBtn.Enabled = false; _cancelBtn.Click += (_, _) => CancelMigration(); actions.Controls.Add(_cancelBtn);
+            var saveLog = new NeonButton(); ConfigureButton(saveLog, "حفظ سجل التشخيص", Theme.NeonCyan); saveLog.Click += (_, _) => SaveLog(); actions.Controls.Add(saveLog);
             _statusLabel.Text = "جاهز."; _statusLabel.AutoSize = false; _statusLabel.Width = 360; _statusLabel.Height = 38; _statusLabel.TextAlign = ContentAlignment.MiddleLeft; _statusLabel.ForeColor = Theme.NeonCyan; _progress.Width = 150; _progress.Height = 20; _progress.BarColor = Theme.NeonGreen; actions.Controls.Add(_progress); actions.Controls.Add(_statusLabel); root.Controls.Add(actions, 0, 4);
 
             var logPanel = Panel("سجل المحرك", Theme.NeonCyan); _logBox.Dock = DockStyle.Fill; _logBox.BackColor = Color.Black; _logBox.ForeColor = Theme.NeonGreen; _logBox.Font = Theme.MonoFont; _logBox.ReadOnly = true; _logBox.BorderStyle = BorderStyle.None; _logBox.WordWrap = false; _logBox.ScrollBars = RichTextBoxScrollBars.Both; logPanel.Controls.Add(_logBox); root.Controls.Add(logPanel, 0, 5);
@@ -144,6 +147,7 @@ namespace WhatsAppMigrator
             if (direction == "android_to_ios" && !ValidateKey()) return;
             try
             {
+                _cancelRequested = false;
                 if (direction == "backup_android") { _backupAttempted = true; _backupReady = false; _androidDbBox.Clear(); _androidMediaBox.Clear(); _backupStateLabel.Text = "جارٍ بدء النسخ؛ لا توجد نسخة جاهزة."; }
                 string engine = LocateEngine(out string? script); var args = BuildArguments(direction); _logBox.Clear(); _reportedSuccess = false; _reportedCandidate = false; _terminalEventSeen = false; _isRunning = true; SetButtons(false); _progress.Value = 0; SetStatus(direction == "check_devices" ? "جارٍ فحص أجهزة أندرويد…" : "جارٍ تشغيل العملية…", Theme.NeonAmber); await RunEngineAsync(engine, script, args, direction == "android_to_ios" ? _hexKeyBox.Text.Trim() : "");
             }
@@ -171,7 +175,7 @@ namespace WhatsAppMigrator
             string Redact(string s) => hexKey.Length == 0 ? s : s.Replace(hexKey, "[REDACTED]");
             process.OutputDataReceived += (_, e) => { if (e.Data != null) HandleOutputLine(Redact(e.Data)); }; process.ErrorDataReceived += (_, e) => { if (e.Data != null) AppendLog("[STDERR] " + Redact(e.Data) + "\n"); };
             process.Start(); process.BeginOutputReadLine(); process.BeginErrorReadLine(); await process.WaitForExitAsync(); process.WaitForExit(); await DrainUiAsync();
-            int code = process.ExitCode; AppendLog($"\n[انتهى المحرك بكود {code}]\n"); if (code != 0) SetStatus($"فشل المحرك (كود {code})", Theme.NeonRed); else if (!_terminalEventSeen) SetStatus("انتهت العملية دون إعلان نتيجة معتمدة.", Theme.NeonAmber);
+            int code = process.ExitCode; AppendLog($"\n[انتهى المحرك بكود {code}]\n"); if (_cancelRequested) SetStatus("أُلغيت العملية؛ الملفات الجزئية ليست نسخة مكتملة.", Theme.NeonAmber); else if (code != 0 && !_terminalEventSeen) SetStatus($"فشل المحرك (كود {code})؛ راجع السجل.", Theme.NeonRed); else if (!_terminalEventSeen) SetStatus("انتهت العملية دون إعلان نتيجة معتمدة.", Theme.NeonAmber);
         }
 
         private void HandleOutputLine(string line)
@@ -183,6 +187,7 @@ namespace WhatsAppMigrator
                 {
                     case "devices": _terminalEventSeen = true; HandleDevices(root, msg); break;
                     case "backup": _terminalEventSeen = true; HandleBackup(root, msg); break;
+                    case "backup_progress": SetStatus(msg, Theme.NeonCyan); AppendLog("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + "\n"); break;
                     case "log": AppendLog("[" + (root.TryGetProperty("level", out var l) ? l.GetString() : "log") + "] " + msg + "\n"); break;
                     case "step": _progress.Value = Math.Clamp(root.TryGetProperty("percent", out var p) ? p.GetInt32() : 0, 0, 100); SetStatus(msg, Theme.NeonCyan); AppendLog("• " + msg + "\n"); break;
                     case "candidate": case "candidate_success": _terminalEventSeen = true; _reportedCandidate = true; AppendLog("⚠ مرشح تجريبي: " + msg + "\n"); SetStatus("مرشح تجريبي — لم يُثبت النقل ولم تُعدّل نسخة آيفون.", Theme.NeonAmber); break;
@@ -207,12 +212,19 @@ namespace WhatsAppMigrator
             _backupAttempted = true; string status = GetString(root, "status"); bool statusSuccess = status.Equals("success", StringComparison.OrdinalIgnoreCase); bool ready = statusSuccess && root.TryGetProperty("conversion_ready", out var r) && r.ValueKind == JsonValueKind.True; _backupReady = ready;
             if (root.TryGetProperty("android_db", out var db) && db.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(db.GetString())) _androidDbBox.Text = db.GetString()!; if (root.TryGetProperty("android_media", out var media) && media.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(media.GetString())) _androidMediaBox.Text = media.GetString()!;
             string dir = GetString(root, "backup_dir"); string manifest = GetString(root, "manifest"); string reasons = GetString(root, "conversion_reasons"); string errors = root.TryGetProperty("errors", out var errorValue) ? errorValue.GetRawText() : ""; string detail = string.IsNullOrWhiteSpace(msg) ? status : msg; if (!string.IsNullOrWhiteSpace(manifest)) detail += " — manifest: " + manifest; if (!string.IsNullOrWhiteSpace(reasons)) detail += " — conversion_reasons: " + reasons; if (!string.IsNullOrWhiteSpace(errors) && errors != "[]") detail += " — errors: " + errors;
-            AppendLog("[backup] " + detail + (string.IsNullOrWhiteSpace(dir) ? "" : " — " + dir) + "\n"); _backupStateLabel.Text = ready ? "الملفات المشتركة جاهزة لمرشح تجريبي فقط." : "النسخ غير جاهز للتحويل."; SetStatus(_backupStateLabel.Text, ready ? Theme.NeonGreen : Theme.NeonAmber);
+            AppendLog("[backup] " + detail + (string.IsNullOrWhiteSpace(dir) ? "" : " — " + dir) + "\n"); _progress.Value = statusSuccess ? 100 : _progress.Value; _backupStateLabel.Text = !statusSuccess ? "فشل النسخ أو بقي ناقصًا؛ راجع السجل." : ready ? "اكتمل النسخ؛ مرشح تجريبي فقط." : "اكتمل نسخ الملفات؛ التحويل غير جاهز."; SetStatus(_backupStateLabel.Text, statusSuccess ? (ready ? Theme.NeonGreen : Theme.NeonAmber) : Theme.NeonRed);
             bool encrypted = status.Contains("encrypt", StringComparison.OrdinalIgnoreCase) || msg.Contains("encrypt", StringComparison.OrdinalIgnoreCase) || status.Contains("مشفر") || msg.Contains("مشفر") || reasons.Contains("encrypt", StringComparison.OrdinalIgnoreCase) || reasons.Contains("مشفر"); if (encrypted) MessageBox.Show("تم العثور على نسخة مشفّرة/crypt15. أدخل المفتاح الصحيح أو فكّها خارجيًا باستخدام wadecrypt ثم استخدم الملف الناتج. قد يظل الناتج مرشحًا تجريبيًا ولا تعني هذه الرسالة الجاهزية.", "نسخ مشفّر", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
-        private static string GetString(JsonElement e, string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+        private static string GetString(JsonElement e, string name)
+        {
+            if (!e.TryGetProperty(name, out var value)) return "";
+            if (value.ValueKind == JsonValueKind.String) return value.GetString() ?? "";
+            if (value.ValueKind == JsonValueKind.Array) { var items = new List<string>(); foreach (var item in value.EnumerateArray()) if (item.ValueKind == JsonValueKind.String) items.Add(item.GetString() ?? ""); return string.Join("; ", items); }
+            return "";
+        }
 
-        private void CancelMigration() { try { if (_engineProcess != null && !_engineProcess.HasExited) _engineProcess.Kill(true); } catch { } AppendLog("\n[تم إلغاء العملية من المستخدم]\n"); SetStatus("أُلغيت العملية.", Theme.NeonAmber); }
+        private void SaveLog() { using var dialog = new SaveFileDialog { Filter = "Text log (*.txt)|*.txt", FileName = "WhatsAppMigrator-diagnostic.txt" }; if (dialog.ShowDialog() != DialogResult.OK) return; try { File.WriteAllText(dialog.FileName, "WhatsAppMigrator — CopyProgressFix 2\n" + _logBox.Text, Encoding.UTF8); } catch (Exception ex) { MessageBox.Show("تعذر حفظ السجل: " + ex.Message); } }
+        private void CancelMigration() { _cancelRequested = true; try { if (_engineProcess != null && !_engineProcess.HasExited) _engineProcess.Kill(true); } catch { } AppendLog("\n[تم إلغاء العملية من المستخدم؛ الملفات الجزئية لا تُستخدم للتحويل]\n"); SetStatus("أُلغيت العملية.", Theme.NeonAmber); }
         private void QueueUi(Action action) { lock (this) _pendingUiCallbacks++; try { BeginInvoke(new Action(() => { try { action(); } finally { lock (this) { if (--_pendingUiCallbacks == 0) _uiDrain?.TrySetResult(true); } } })); } catch { lock (this) { _pendingUiCallbacks--; } } }
         private async Task DrainUiAsync() { Task? wait = null; lock (this) { if (_pendingUiCallbacks > 0) { _uiDrain = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously); wait = _uiDrain.Task; } } if (wait != null) await wait; }
         private void AppendLog(string text) { if (_logBox.InvokeRequired) { QueueUi(() => AppendLog(text)); return; } _logBox.AppendText(text); _logBox.SelectionStart = _logBox.TextLength; _logBox.ScrollToCaret(); }

@@ -38,6 +38,21 @@ class DeviceCommandTests(unittest.TestCase):
         self.assertFalse(events[-1]['conversion_ready'])
         self.assertNotIn('success', [event['type'] for event in events])
 
+    def test_backup_streams_progress_before_terminal_result(self):
+        def backup(self, *args):
+            self.on_progress({'stage': 'pull', 'message': 'نسخ Media: 2 MiB', 'bytes': 2097152})
+            return {'status': 'failed', 'conversion_ready': False, 'errors': ['USB disconnected']}
+
+        with patch('android_backup.AndroidBackup.backup', backup):
+            code, events = self.invoke(['--direction', 'backup_android', '--android-serial', 'TEST',
+                                        '--backup-dir', '/copies'])
+        self.assertEqual(code, 1)
+        progress = next(e for e in events if e['type'] == 'backup_progress')
+        self.assertEqual(progress['bytes'], 2097152)
+        self.assertIn('نسخ Media', progress['message'])
+        self.assertEqual(events[-1]['type'], 'backup')
+        self.assertEqual(events[-1]['status'], 'failed')
+
     def test_backup_requires_explicit_serial_and_destination(self):
         with patch('android_backup.AndroidBackup.backup') as backup:
             code, events = self.invoke(['--direction', 'backup_android'])
